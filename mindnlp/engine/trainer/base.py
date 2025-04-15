@@ -38,12 +38,15 @@ import mindspore
 from mindspore.dataset import Dataset, BatchDataset, PaddedBatchDataset
 
 from mindnlp.core import nn, ops, optim
+from ...core.autograd import value_and_grad
 from ...core.serialization import safe_load_file, safe_save_file, save, save_checkpoint, load, load_checkpoint
 from ...peft import PeftModel
 from ...configs import WEIGHTS_NAME, CONFIG_NAME, ADAPTER_WEIGHTS_NAME, ADAPTER_SAFE_WEIGHTS_NAME, \
     WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from ...dataset import BaseMapFunction
 from ...utils import logging, find_labels, can_return_loss
+from ...accelerate.utils import DistributedType
+from ...accelerate.utils import accelerate_distributed_type
 from ...utils.import_utils import is_safetensors_available
 from ...transformers.modeling_utils import PreTrainedModel
 from ...transformers.configuration_utils import PretrainedConfig
@@ -123,7 +126,6 @@ class Trainer:
     """
     Trainer is a simple but feature-complete training and eval loop for MindSpore, optimized for 🤗 Transformers.
     """
-    from ..utils import _get_learning_rate
     def __init__(
         self,
         model: Union[PreTrainedModel, nn.Module] = None,
@@ -283,6 +285,30 @@ class Trainer:
         # Internal variables to help with automatic batch size reduction
         self._train_batch_size = args.train_batch_size
         self._created_lr_scheduler = False
+        self.actual_distributed_type = accelerate_distributed_type
+
+
+    def _get_learning_rate(self):
+        r"""
+        This function retrieves the learning rate used by the optimizer.
+        
+        Args:
+            self: An instance of the class containing the optimizer and learning rate scheduler.
+        
+        Returns:
+            The learning rate value (float) used by the optimizer.
+        
+        Raises:
+            None.
+        """
+        if isinstance(self.lr_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            last_lr = self.optimizer.param_groups[0]["lr"]
+        else:
+            last_lr = self.lr_scheduler.get_last_lr()[0]
+        if ops.is_tensor(last_lr):
+            last_lr = last_lr.item()
+        return last_lr
+
 
     def _activate_neftune(self, model):
         r"""
@@ -544,7 +570,7 @@ class Trainer:
             num_training_steps (int): The number of training steps to do.
         """
         if self.lr_scheduler is None:
-            from ...transformers.optimization import get_scheduler
+            from ...common.optimization import get_scheduler
             self.lr_scheduler = get_scheduler(
                 self.args.lr_scheduler_type,
                 optimizer=self.optimizer if optimizer is None else optimizer,
@@ -1104,7 +1130,7 @@ MindSpore's `load_checkpoint` function.
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                tr_loss_step, grads = self.training_step(model, inputs)
+                tr_loss_step = self.training_step(model, inputs)
                 if (
                     args.logging_nan_inf_filter
                     and (ops.isnan(tr_loss_step) or ops.isinf(tr_loss_step))
@@ -1129,11 +1155,12 @@ MindSpore's `load_checkpoint` function.
                     if args.max_grad_norm is not None and args.max_grad_norm > 0:
                         # deepspeed does its own clipping
                         _grad_norm = nn.utils.clip_grad_norm_(
-                            grads,
+                            model.parameters(),
                             args.max_grad_norm,
                         )
+
                     # Optimizer step
-                    self.optimizer.step(grads)
+                    self.optimizer.step()
 
                     optimizer_was_run = True
                     if optimizer_was_run:
@@ -1141,6 +1168,7 @@ MindSpore's `load_checkpoint` function.
                         if not isinstance(self.lr_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
                             self.lr_scheduler.step()
 
+                    model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
@@ -1349,6 +1377,20 @@ indicating whether to prefer safe tensors.
 
         return inputs
 
+
+    def update_gradient_by_distributed_type(self, model: nn.Module) -> None:
+        """update gradient by distributed_type"""
+        if accelerate_distributed_type == DistributedType.NO:
+            return
+        if accelerate_distributed_type == DistributedType.MULTI_NPU:
+            from mindspore.communication import get_group_size
+            from mindspore.communication.comm_func import all_reduce
+            rank_size = get_group_size()
+            for parameter in model.parameters():
+                new_grads_mean = all_reduce(parameter.grad) / rank_size
+                parameter.grad = new_grads_mean
+
+
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[mindspore.Tensor, Any]]) -> Tuple[List[mindspore.Tensor], mindspore.Tensor]:
         """
         Perform a training step on a batch of inputs.
@@ -1377,11 +1419,11 @@ indicating whether to prefer safe tensors.
             weights = ()
             for group in self.optimizer.param_groups:
                 weights += tuple(group['params'])
-            self.grad_fn = mindspore.value_and_grad(forward, None, weights)
+            self.grad_fn = value_and_grad(forward, weights, attach_grads=True)
 
-        loss, grads = self.grad_fn(inputs)
-
-        return loss / self.args.gradient_accumulation_steps, grads
+        loss = self.grad_fn(inputs)
+        self.update_gradient_by_distributed_type(model)
+        return loss / self.args.gradient_accumulation_steps
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
